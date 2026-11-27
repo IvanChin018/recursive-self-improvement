@@ -178,6 +178,12 @@ class StrategyEnsembleAgent(Agent):
                 proposals.append(prop)
 
         if proposals:
+            # keep latest map for Execution intake (idempotency + lookup)
+            last = {p.id: p for p in self.bus.get("proposals.last", [], allow_stale=True)}
+            last.update({p.id: p for p in proposals})
+            cutoff = now - 7200
+            last = {k: v for k, v in last.items() if getattr(v, "created_t", now) > cutoff}
+            self.bus.set("proposals.last", list(last.values()))
             self.bus.publish("proposals", proposals)
             for p in proposals:
                 self.log.info("PROPOSAL %s %s conf=%.2f rr=%.2f sl=%.2f tp=%.2f <- %s",

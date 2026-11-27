@@ -43,8 +43,9 @@ class PortfolioAllocAgent(Agent):
     # ---------------- correlation ---------------- #
     def _usd_notional(self, pos, quote) -> float:
         """USD notional of a position (contract_size * price * fx_to_usd)."""
-        spec = self.gateway.spec(pos.symbol) if getattr(self, "gateway", None) else \
-            get_spec(pos.symbol)
+        spec = (self.gateway.spec(pos.symbol) if getattr(self, "gateway", None)
+                else self.bus.get("broker.spec_fn", lambda s: None)(pos.symbol)) \
+            or get_spec(pos.symbol)
         px = (quote.mid if quote is not None else pos.open_price)
         fx = 1.0
         if spec.needs_fx_conversion and self.store is not None:

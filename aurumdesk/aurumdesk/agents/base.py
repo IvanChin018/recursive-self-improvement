@@ -25,6 +25,7 @@ class Agent:
         self._stop = threading.Event()
         self.last_tick_t: float = 0.0
         self.ticks: int = 0
+        self._born_t: float = time.time()
         self.errors: int = 0
         self.last_error: str = ""
 

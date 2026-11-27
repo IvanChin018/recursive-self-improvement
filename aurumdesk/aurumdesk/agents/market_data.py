@@ -15,6 +15,7 @@ from typing import Dict
 from ..bus import Bus
 from ..data.mt5_feed import MTFeed
 from ..data.store import MarketStore
+from ..instruments import get_spec
 from ..data.synthetic_feed import SyntheticFeed
 from ..models import Timeframe
 from .base import Agent
@@ -26,6 +27,13 @@ class MarketDataAgent(Agent):
     def __init__(self, bus: Bus, cfg: dict, log_dir: str = "logs"):
         super().__init__(bus, cfg, log_dir)
         self.symbols: list[str] = cfg["symbols"]
+        # helper FX legs needed for cross-metal PnL conversion (paper mode)
+        fx_legs = set()
+        for s in self.symbols:
+            sp = get_spec(s)
+            if sp.needs_fx_conversion and sp.fx_symbol:
+                fx_legs.add(sp.fx_symbol)
+        self.data_symbols = self.symbols + sorted(fx_legs - set(self.symbols))
         self.tfs = [Timeframe(t) for t in cfg["timeframes"]]
         self.store = MarketStore(cfg.get("candles_keep", {}))
         self.mt5 = MTFeed(cfg, self.log)
@@ -35,7 +43,7 @@ class MarketDataAgent(Agent):
         self.stale_after = float(cfg["data"].get("stale_after_sec", 180))
         self._last_hist_fetch: Dict[str, float] = {}
         self._last_candle_t: Dict[str, Dict[Timeframe, int]] = {
-            s: {} for s in self.symbols}
+            s: {} for s in self.data_symbols}
         self._synth_bar_bucket = 0
 
     def setup(self) -> None:
@@ -48,8 +56,8 @@ class MarketDataAgent(Agent):
                              "On your PC with MT5 running this auto-switches to real data.",
                              self.mt5.last_error)
             self.source = "synthetic"
-        # prime history
-        for s in self.symbols:
+        # prime history (incl. helper FX legs)
+        for s in self.data_symbols:
             for tf in self.tfs:
                 self._fetch_history(s, tf, force=True)
         self.bus.set("market.source", self.source)
@@ -118,11 +126,18 @@ class MarketDataAgent(Agent):
                 for s in self.symbols:
                     for tf in self.tfs:
                         self._fetch_history(s, tf)
-            for s in self.symbols:
+            for s in self.data_symbols:
                 for tf in self.tfs:
                     self._live_bar_synth(s, tf, now)
+            # publish live fx rates for the paper broker's PnL conversion
+            fx = {}
+            for f in ("AUDUSD", "EURUSD"):
+                qq = self.synth.quote(f)
+                if qq:
+                    fx[f] = qq.mid
+            self.bus.set("market.fx_rates", fx, max_age_sec=self.stale_after)
         else:
-            for s in self.symbols:
+            for s in self.data_symbols:
                 q = self.mt5.quote(s)
                 if q:
                     self.quotes[s] = q

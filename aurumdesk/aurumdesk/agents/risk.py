@@ -62,7 +62,8 @@ class RiskManagerAgent(Agent):
 
     # ---------------- helpers ---------------- #
     def _value_per_unit(self, sym: str) -> float:
-        spec = self.gateway.spec(sym) if self.gateway else None
+        spec = (self.gateway.spec(sym) if self.gateway
+                else self.bus.get("broker.spec_fn", lambda s: None)(s))
         if spec is None:
             return 100.0
         fx = 1.0
