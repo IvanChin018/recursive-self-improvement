@@ -34,43 +34,49 @@ class _VoteCtx(_Ctx):
     def __init__(self, now): self.now=now; self.macro=None; self.candle_signals={}; self.fx_momentum={}
 
 def gen_history(synth, sym, n, step=900, end_t=None):
-    # walk forward from a start price using synth vol params
-    from aurumdesk.data.synthetic_feed import CROSS_DEFS
+    """Build an OHLCV history consistent with the live SyntheticFeed dynamics.
+
+    Base metals follow a mean-reverting OU log-price (drift + vol from the
+    feed params).  Crosses (XAUAUD etc.) are derived as metalUSD / XXXUSD so
+    their candles are internally consistent with the legs — exactly like the
+    live feed does it.
+    """
+    from aurumdesk.data.synthetic_feed import CROSS_DEFS, SESSION_VOL_MULT
     if sym in CROSS_DEFS:
         num, den = CROSS_DEFS[sym]
-        rngx = random.Random((hash(num)+hash(den)) & 0xffff)
-        pn = _path(synth.params[num], n, step, rngx)
-        pd_ = _path(synth.params[den], n, step, rngx)
-        arr = lambda x: np.array(x)
-        ratio = np.array(pn["o"]) / np.array(pd_["o"])
-        return dict(t=pn["t"], o=ratio, c=ratio,
-                    h=ratio*1.0007, l=ratio*0.9993,
+        pn = gen_history(synth, num, n, step, end_t)
+        pd_ = gen_history(synth, den, n, step, end_t)
+        ratio = pn["o"] / np.maximum(pd_["o"], 1e-9)
+        rc = pn["c"] / np.maximum(pd_["c"], 1e-9)
+        rh = pn["h"] / np.maximum(pd_["l"], 1e-9)
+        rl = pn["l"] / np.maximum(pd_["h"], 1e-9)
+        return dict(t=pn["t"], o=ratio, h=rh, l=rl, c=rc,
                     v=np.full(n, 1000.0))
     base = synth.params[sym]
-    r = _path(base, n, step, random.Random(hash(sym) & 0xffff))
-    a=np.array
-    return dict(t=a(r["t"]),o=a(r["o"]),h=a(r["h"]),l=a(r["l"]),c=a(r["c"]),v=a(r["v"]))
-
-def _path(base, n, step, rng):
-    p = base["p0"]; sig = base["vol"]/math.sqrt(365*24*3600/step)
-    ts,os_,hs,ls,cs,vs=[],[],[],[],[],[]
+    rng = random.Random(abs(hash(sym)) % 100000 + (getattr(synth, "seed", None) or 0))
+    p = base["p0"]
+    dt = step / 86400.0
+    drift = float(base.get("drift", 0.05))     # mild positive metals drift/yr
+    vol = float(base["vol"])                   # annualized vol
+    sig = vol * math.sqrt(dt)
+    t0 = int(end_t // step * step) - n * step if end_t else 0
+    ts, os_, hs, ls, cs, vs = [], [], [], [], [], []
     for i in range(n):
-        o=p; ret=rng.gauss(0,sig); c=o*math.exp(ret)
-        wick=abs(rng.gauss(0,sig))*o*0.7
-        h=max(o,c)+wick*rng.random(); l=min(o,c)-wick*rng.random()
-        ts.append(i*step); os_.append(o); hs.append(h); ls.append(l); cs.append(c); vs.append(rng.uniform(500,2500))
-        p=c
-    return dict(t=ts,o=os_,h=hs,l=ls,c=cs,v=vs,p=[p])
-    rng = random.Random(hash(sym) & 0xffff)
-    t0 = int(end_t//step*step) - n*step
-    ts,os_,hs,ls,cs,vs = [],[],[],[],[],[]
-    for i in range(n):
-        o=p; ret=rng.gauss(0,sig); c=o*math.exp(ret)
-        wick=abs(rng.gauss(0,sig))*o*0.7
-        h=max(o,c)+wick*rng.random(); l=min(o,c)-wick*rng.random()
-        ts.append(t0+i*step); os_.append(o); hs.append(h); ls.append(l); cs.append(c); vs.append(rng.uniform(500,2500))
-        p=c
-    return dict(t=np.array(ts),o=np.array(os_),h=np.array(hs),l=np.array(ls),c=np.array(cs),v=np.array(vs))
+        o = p
+        # stochastic vol (OU around 1.0) + session profile — mirrors live feed
+        vo = max(0.4, min(2.5, (ts and 1.0) or 1.0))
+        hour = ((t0 + i * step) / 3600.0) % 24
+        smult = SESSION_VOL_MULT.get(int(hour), 1.0)
+        c = o * math.exp((drift / 365.0 - 0.5 * vol * vol) * dt
+                         + vol * smult * math.sqrt(dt) * rng.gauss(0, 1))
+        wick = abs(rng.gauss(0, sig * smult)) * o * 0.7
+        h = max(o, c) + wick * rng.random()
+        l = min(o, c) - wick * rng.random()
+        ts.append(t0 + i * step); os_.append(o); hs.append(h)
+        ls.append(l); cs.append(c); vs.append(rng.uniform(500, 2500))
+        p = c
+    a = np.array
+    return dict(t=a(ts), o=a(os_), h=a(hs), l=a(ls), c=a(cs), v=a(vs))
 
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument("--days",type=int,default=45)
@@ -85,7 +91,9 @@ def main():
     strats=[TrendFollowing(),Breakout(),MeanReversion(),CandleEdge(),CarryMacro(),PairsRelative(),SessionMomentum()]
     equity=10_000.0; peak=equity; curve=[]; trades=[]; warm=200
     stop_cfg=cfg["risk"]["stop"]
-    for i in range(warm,n-1):
+    max_pos=int(cfg["risk"].get("max_open_positions",8))
+    open_trades=[]          # list of dicts: symbol, side, entry, sl, tp, lots, vpu, j index
+    def vote_at(i):
         votes_all={}
         for s in syms:
             d={k:(full[s][k][:i+1]) for k,v in data[s].items()}
@@ -97,43 +105,58 @@ def main():
                 except Exception: v=None
                 if v: vs.append(v)
             votes_all[s]=vs
-        for s,votes in votes_all.items():
-            if not votes: continue
-            d=store.data[s]; atr_=float(ind.atr(d["h"],d["l"],d["c"],14)[-1])
-            if np.isnan(atr_) or atr_<=0: continue
-            lw=sum(v.weight*v.conviction for v in votes if v.direction==SignalDirection.LONG)
-            sw=sum(v.weight*v.conviction for v in votes if v.direction==SignalDirection.SHORT)
-            tw=sum(v.weight for v in votes)
-            net=lw-sw; side=Side.BUY if net>0 else Side.SELL if net<0 else Side.FLAT
-            if side==Side.FLAT: continue
-            al=[v for v in votes if (v.direction==SignalDirection.LONG)==(side==Side.BUY)]
-            if len(al)<2: continue
-            conf=min(abs(net)/tw*1.6+min(0.25,0.08*(len(al)-1)),0.99)
-            if conf<cfg["strategies"]["min_confidence"]: continue
-            entry=d["c"][-1]; risk=stop_cfg["atr_mult"]*atr_
-            sl=entry-risk if side==Side.BUY else entry+risk
-            tp=entry+stop_cfg["tp_rr"]*risk if side==Side.BUY else entry-stop_cfg["tp_rr"]*risk
-            spec=get_spec(s); vpu=spec.contract_size
-            lots=round_step(position_size_by_risk(equity,cfg["risk"]["risk_per_trade_pct"]*np.interp(conf,[0.5,1],[0.5,1.25]),risk,vpu),0.01,"down")
-            if lots<spec.min_lot: continue
-            # simulate next bars until SL/TP or 96 bars (24h)
-            j=i+1; end=min(n,i+96); out=None
-            hi=full[s]["h"][j:end]; lo=full[s]["l"][j:end]
-            for k in range(len(hi)):
-                px_b=hi[k]; px_a=lo[k]
-                if side==Side.BUY:
-                    if px_a<=sl: out=-risk; break
-                    if px_b>=tp: out=stop_cfg["tp_rr"]*risk; break
-                else:
-                    if px_b>=sl: out=-risk; break
-                    if px_a<=tp: out=stop_cfg["tp_rr"]*risk; break
-            if out is None:
-                last=(full[s]["c"][end-1]-entry)*(1 if side==Side.BUY else -1); out=last
-            pnl=out*lots*vpu
-            # costs: spread ~ half of typical spread
-            pnl-=lots*spec.contract_size*entry*(0.0003 if "USD" in s else 0.0005)
-            equity+=pnl; trades.append(pnl); curve.append(equity)
-            peak=max(peak,equity)
+        return votes_all
+    i=warm
+    while i<n-1:
+        # 1) manage existing trades bar-by-bar (conservative: SL checked first)
+        still=[]
+        for tr in open_trades:
+            hi=full[tr["symbol"]]["h"][tr["j"]]; lo=full[tr["symbol"]]["l"][tr["j"]]
+            out=None; reason="time"
+            if tr["side"]==Side.BUY:
+                if lo<=tr["sl"]: out=tr["sl"]-tr["entry"]; reason="sl"
+                elif hi>=tr["tp"]: out=tr["tp"]-tr["entry"]; reason="tp"
+            else:
+                if hi>=tr["sl"]: out=tr["entry"]-tr["sl"]; reason="sl"
+                elif lo<=tr["tp"]: out=tr["entry"]-tr["tp"]; reason="tp"
+            if out is None and tr["j"]>=min(n-1,tr["i0"]+96):   # 24h time-stop
+                out=(full[tr["symbol"]]["c"][tr["j"]]-tr["entry"])*(1 if tr["side"]==Side.BUY else -1)
+            if out is not None:
+                pnl=out*tr["lots"]*tr["vpu"]
+                pnl-=tr["lots"]*tr["vpu"]*tr["entry"]*(0.0003 if "USD"==tr["symbol"][3:] else 0.0005)
+                equity+=pnl; trades.append(pnl)
+            else:
+                tr["j"]+=1; still.append(tr)
+        open_trades=still
+        # 2) new entries at close of bar i (fills next bar's open — no lookahead)
+        held={tr["symbol"] for tr in open_trades}
+        if len(open_trades)<max_pos:
+            votes_all=vote_at(i)
+            for s,votes in votes_all.items():
+                if not votes or s in held or len(open_trades)>=max_pos: continue
+                d=store.data[s]; atr_=float(ind.atr(d["h"],d["l"],d["c"],14)[-1])
+                if np.isnan(atr_) or atr_<=0: continue
+                lw=sum(v.weight*v.conviction for v in votes if v.direction==SignalDirection.LONG)
+                sw=sum(v.weight*v.conviction for v in votes if v.direction==SignalDirection.SHORT)
+                tw=sum(v.weight for v in votes)
+                net=lw-sw; side=Side.BUY if net>0 else Side.SELL if net<0 else Side.FLAT
+                if side==Side.FLAT: continue
+                al=[v for v in votes if (v.direction==SignalDirection.LONG)==(side==Side.BUY)]
+                if len(al)<2: continue
+                conf=min(abs(net)/tw*1.6+min(0.25,0.08*(len(al)-1)),0.99)
+                if conf<cfg["strategies"]["min_confidence"]: continue
+                entry=float(full[s]["o"][i+1]) if i+1<n else float(d["c"][-1])
+                risk=stop_cfg["atr_mult"]*atr_
+                sl=entry-risk if side==Side.BUY else entry+risk
+                tp=entry+stop_cfg["tp_rr"]*risk if side==Side.BUY else entry-stop_cfg["tp_rr"]*risk
+                spec=get_spec(s); vpu=spec.contract_size
+                lots=round_step(position_size_by_risk(equity,cfg["risk"]["risk_per_trade_pct"]*np.interp(conf,[0.5,1],[0.5,1.25]),risk,vpu),0.01,"down")
+                if lots<spec.min_lot: continue
+                open_trades.append(dict(symbol=s,side=side,entry=entry,sl=sl,tp=tp,
+                                        lots=lots,vpu=vpu,i0=i+1,j=i+1))
+                held.add(s)
+        curve.append(equity); peak=max(peak,equity)
+        i+=1
     wins=[t for t in trades if t>0]; losses=[t for t in trades if t<=0]
     run_peak = 10_000.0; dd = 0.0
     for e in curve:
